@@ -21,6 +21,7 @@ end
 
 require_relative "client/http_connection_wrapper"
 require_relative "client/key_pair_jwt_auth_manager"
+require_relative "client/token_auth_manager"
 require_relative "client/single_thread_in_memory_strategy"
 require_relative "client/streaming_result_strategy"
 require_relative "client/threaded_in_memory_strategy"
@@ -85,38 +86,60 @@ module RubySnowflake
                       http_retries: env_option("SNOWFLAKE_HTTP_RETRIES", DEFAULT_HTTP_RETRIES),
                       query_timeout: env_option("SNOWFLAKE_QUERY_TIMEOUT", DEFAULT_QUERY_TIMEOUT),
                       default_role: env_option("SNOWFLAKE_DEFAULT_ROLE", DEFAULT_ROLE))
-      private_key =
-        if key = ENV["SNOWFLAKE_PRIVATE_KEY"]
-          key
-        elsif path = ENV["SNOWFLAKE_PRIVATE_KEY_PATH"]
-          File.read(path)
-        else
-          raise MissingConfig, "Either ENV['SNOWFLAKE_PRIVATE_KEY'] or ENV['SNOWFLAKE_PRIVATE_KEY_PATH'] must be set"
-        end
+      # Check for access token first (programmatic access token authentication)
+      if access_token = ENV["SNOWFLAKE_ACCESS_TOKEN"]
+        new(
+          ENV.fetch("SNOWFLAKE_URI"),
+          ENV["SNOWFLAKE_DEFAULT_WAREHOUSE"],
+          ENV["SNOWFLAKE_DEFAULT_DATABASE"],
+          access_token: access_token,
+          default_role: ENV.fetch("SNOWFLAKE_DEFAULT_ROLE", nil),
+          logger: logger,
+          log_level: log_level,
+          connection_timeout: connection_timeout,
+          max_connections: max_connections,
+          max_threads_per_query: max_threads_per_query,
+          thread_scale_factor: thread_scale_factor,
+          http_retries: http_retries,
+          query_timeout: query_timeout,
+        )
+      else
+        # Fall back to key pair authentication
+        private_key =
+          if key = ENV["SNOWFLAKE_PRIVATE_KEY"]
+            key
+          elsif path = ENV["SNOWFLAKE_PRIVATE_KEY_PATH"]
+            File.read(path)
+          else
+            raise MissingConfig, "Either ENV['SNOWFLAKE_ACCESS_TOKEN'] or ENV['SNOWFLAKE_PRIVATE_KEY'] or ENV['SNOWFLAKE_PRIVATE_KEY_PATH'] must be set"
+          end
 
-      new(
-        ENV.fetch("SNOWFLAKE_URI"),
-        private_key,
-        ENV.fetch("SNOWFLAKE_ORGANIZATION"),
-        ENV.fetch("SNOWFLAKE_ACCOUNT"),
-        ENV.fetch("SNOWFLAKE_USER"),
-        ENV["SNOWFLAKE_DEFAULT_WAREHOUSE"],
-        ENV["SNOWFLAKE_DEFAULT_DATABASE"],
-        default_role: ENV.fetch("SNOWFLAKE_DEFAULT_ROLE", nil),
-        logger: logger,
-        log_level: log_level,
-        jwt_token_ttl: jwt_token_ttl,
-        connection_timeout: connection_timeout,
-        max_connections: max_connections,
-        max_threads_per_query: max_threads_per_query,
-        thread_scale_factor: thread_scale_factor,
-        http_retries: http_retries,
-        query_timeout: query_timeout,
-      )
+        new(
+          ENV.fetch("SNOWFLAKE_URI"),
+          ENV.fetch("SNOWFLAKE_ORGANIZATION"),
+          ENV.fetch("SNOWFLAKE_ACCOUNT"),
+          ENV.fetch("SNOWFLAKE_USER"),
+          ENV["SNOWFLAKE_DEFAULT_WAREHOUSE"],
+          ENV["SNOWFLAKE_DEFAULT_DATABASE"],
+          private_key: private_key,
+          default_role: ENV.fetch("SNOWFLAKE_DEFAULT_ROLE", nil),
+          logger: logger,
+          log_level: log_level,
+          jwt_token_ttl: jwt_token_ttl,
+          connection_timeout: connection_timeout,
+          max_connections: max_connections,
+          max_threads_per_query: max_threads_per_query,
+          thread_scale_factor: thread_scale_factor,
+          http_retries: http_retries,
+          query_timeout: query_timeout,
+        )
+      end
     end
 
     def initialize(
-      uri, private_key, organization, account, user, default_warehouse, default_database,
+      uri, organization=nil, account=nil, user=nil, default_warehouse=nil, default_database=nil,
+      private_key: nil,
+      access_token: nil,
       default_role: nil,
       logger: DEFAULT_LOGGER,
       log_level: DEFAULT_LOG_LEVEL,
@@ -129,11 +152,21 @@ module RubySnowflake
       query_timeout: DEFAULT_QUERY_TIMEOUT
     )
       @base_uri = uri
-      @key_pair_jwt_auth_manager =
-        KeyPairJwtAuthManager.new(organization, account, user, private_key, jwt_token_ttl)
       @default_warehouse = default_warehouse
       @default_database = default_database
       @default_role = default_role
+
+      # Set up authentication manager based on what credentials are provided
+      if access_token
+        @auth_manager = TokenAuthManager.new(access_token)
+        @auth_type = :programmatic_access_token
+      elsif private_key
+        raise MissingConfig, "organization, account, and user are required for key pair authentication" if organization.nil? || account.nil? || user.nil?
+        @auth_manager = KeyPairJwtAuthManager.new(organization, account, user, private_key, jwt_token_ttl)
+        @auth_type = :keypair_jwt
+      else
+        raise MissingConfig, "Either access_token or private_key must be provided"
+      end
 
       # set defaults for config settings
       @logger = logger
@@ -191,7 +224,8 @@ module RubySnowflake
     # This method can be used to populate the JWT token used for authentication
     # in tests that require time travel.
     def create_jwt_token
-      @key_pair_jwt_auth_manager.jwt_token
+      raise "create_jwt_token is only available for key pair authentication" unless @auth_type == :keypair_jwt
+      @auth_manager.jwt_token
     end
 
     private_class_method :env_option
@@ -216,8 +250,16 @@ module RubySnowflake
         request = request_class.new(uri)
         request["Content-Type"] = "application/json"
         request["Accept"] = "application/json"
-        request["Authorization"] = "Bearer #{@key_pair_jwt_auth_manager.jwt_token}"
-        request["X-Snowflake-Authorization-Token-Type"] = "KEYPAIR_JWT"
+
+        # Set authorization header and token type based on auth method
+        if @auth_type == :programmatic_access_token
+          request["Authorization"] = "Bearer #{@auth_manager.token}"
+          request["X-Snowflake-Authorization-Token-Type"] = "PROGRAMMATIC_ACCESS_TOKEN"
+        else # :keypair_jwt
+          request["Authorization"] = "Bearer #{@auth_manager.jwt_token}"
+          request["X-Snowflake-Authorization-Token-Type"] = "KEYPAIR_JWT"
+        end
+
         request.body = body unless body.nil?
 
         Retryable.retryable(tries: @http_retries + 1,
